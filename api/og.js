@@ -52,7 +52,8 @@ function renderGeneric(res) {
     <meta property="og:url" content="${SITE_URL}/" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Danda" />
-    <meta property="og:image" content="${SITE_URL}/og-image.png" />
+    <meta property="og:image" content="${SITE_URL}/og-image.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
     <meta name="twitter:card" content="summary" />
     <meta name="twitter:title" content="${escapeHtml(GENERIC_TITLE)}" />
     <meta name="twitter:description" content="${escapeHtml(GENERIC_DESCRIPTION)}" />
@@ -160,7 +161,11 @@ export default async function handler(req, res) {
 
   const canonicalPath = biz.slug ? `/${biz.slug}` : `/?business=${encodeURIComponent(businessId)}`;
   const canonicalUrl = `${SITE_URL}${canonicalPath}`;
-  const ogImage = biz.avatar_url || `${SITE_URL}/og-image.png`;
+  const ogImage = biz.avatar_url || `${SITE_URL}/og-image.jpg`;
+  // image:type is only known for our own fallback asset — a business's own
+  // uploaded avatar_url can be any format (png/jpg/webp), so it's omitted
+  // rather than guessed when that's what's being served.
+  const ogImageType = biz.avatar_url ? '' : '<meta property="og:image:type" content="image/jpeg" />';
 
   const html = `<!doctype html>
 <html lang="en">
@@ -175,6 +180,7 @@ export default async function handler(req, res) {
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Danda" />
     <meta property="og:image" content="${escapeHtml(ogImage)}" />
+    ${ogImageType}
     <meta name="twitter:card" content="summary" />
     <meta name="twitter:title" content="${escapeHtml(title)}" />
     <meta name="twitter:description" content="${escapeHtml(description)}" />
