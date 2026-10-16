@@ -1,5 +1,6 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { activatePaystackTransaction } from '../_shared/paystackActivation.ts';
+import { handleBookingCharge, isBookingCharge } from '../_shared/bookingPayment.ts';
 
 // No CORS headers — this endpoint is never called from a browser, only
 // server-to-server by Paystack.
@@ -84,6 +85,19 @@ Deno.serve(async (req: Request) => {
   const DB = createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+
+  // Route by charge type BEFORE the subscription path. Booking charges
+  // (metadata.type === 'booking' or a DBK_ reference) go to their own handler
+  // and return from here — they must never reach activatePaystackTransaction,
+  // whose SABI_ reference parsing would otherwise be the only thing standing
+  // between a booking payment and a subscription activation.
+  if (isBookingCharge(event.data)) {
+    const outcome = await handleBookingCharge(DB, event.data, secret);
+    console.log('[paystack-webhook] booking charge:', outcome.note);
+    // Only transient failures (Paystack/DB unreachable) ask Paystack to retry;
+    // permanent conditions are logged and acknowledged.
+    return outcome.retry ? new Response('retry', { status: 500 }) : new Response('ok', { status: 200 });
+  }
 
   // Same amount/currency check, idempotency, expiry anchoring, and
   // service-role write as verify-payment — see

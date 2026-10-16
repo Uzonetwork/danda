@@ -52,6 +52,13 @@ export async function activatePaystackTransaction(
   paystackData: any,
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<{ status: number; body: any }> {
+  // Booking payments (DBK_ references / metadata.type 'booking') are handled
+  // by _shared/bookingPayment.ts. paystack-webhook routes them away before
+  // this function; this is the second line of defence so a booking charge can
+  // never extend a subscription, whichever caller got it here.
+  if (String(paystackData?.reference ?? '').startsWith('DBK_') || paystackData?.metadata?.type === 'booking') {
+    return { status: 422, body: { error: 'Not a subscription payment' } };
+  }
   if (paystackData?.status !== 'success') {
     return { status: 422, body: { error: 'Payment was not successful' } };
   }
