@@ -41,6 +41,8 @@ import { supabase } from '../lib/supabase';
 import { track } from '../lib/posthog';
 import { getBusinessTheme } from '../lib/getBusinessTheme';
 import { normalizeNgPhone, isPlausibleNgPhone } from '../lib/phone';
+import { callFunction } from '../lib/edgeFn';
+import { computeAmountDue } from '../lib/bookingPayment';
 import { useCopyToClipboard } from '../lib/useCopyToClipboard';
 import { StarPicker } from '../components/StarRating';
 import Monogram from '../components/public/Monogram';
@@ -201,7 +203,7 @@ function buildStartsAtIso(dateStr, timeStr, ampm) {
 function buildWhatsAppUrl(whatsapp, submittedForm) {
   const number = normalizeNgPhone(whatsapp);
   if (!number) return null;
-  const { client_name, client_phone, service_name, date, time, ampm, notes } = submittedForm;
+  const { client_name, client_phone, service_name, date, time, ampm, notes, amount_paid, balance } = submittedForm;
   let readableDate = date;
   if (date) {
     const [y, m, d] = date.split('-').map(Number);
@@ -210,12 +212,18 @@ function buildWhatsAppUrl(whatsapp, submittedForm) {
     });
   }
   const lines = [
-    '🔔 New Booking Request!', '',
+    amount_paid ? '✅ New Booking — Payment Received!' : '🔔 New Booking Request!', '',
     `Client: ${client_name}`, `Phone: ${client_phone}`,
     `Service: ${service_name}`, `Date: ${readableDate}`, `Time: ${time} ${ampm}`,
   ];
   if (notes?.trim()) lines.push(`Notes: ${notes.trim()}`);
-  lines.push('', 'Open your Danda dashboard to confirm or cancel this booking.');
+  if (amount_paid) {
+    lines.push('', `Paid online: ₦${Number(amount_paid).toLocaleString()}`);
+    if (balance > 0) lines.push(`Balance due at venue: ₦${Number(balance).toLocaleString()}`);
+    lines.push('', 'This booking is already confirmed in your Danda dashboard.');
+  } else {
+    lines.push('', 'Open your Danda dashboard to confirm or cancel this booking.');
+  }
   return `https://wa.me/${number}?text=${encodeURIComponent(lines.join('\n'))}`;
 }
 
@@ -233,6 +241,26 @@ const TIME_SLOTS = [
   { label: '6:00 PM',  time: '6:00',  ampm: 'PM' },
   { label: '7:00 PM',  time: '7:00',  ampm: 'PM' },
 ];
+
+// A paid booking sends the customer to Paystack's hosted checkout and back,
+// so the poll token has to survive a full page navigation. Storage can be
+// unavailable (private mode), so every access is guarded — without it the
+// customer simply isn't auto-resumed on return; the booking still confirms
+// through the webhook.
+const PENDING_KEY = 'danda_pending_booking';
+const PENDING_MAX_AGE_MS = 45 * 60 * 1000; // hold (30 min) + margin
+const POLL_INTERVAL_MS = 4000;
+const POLL_MAX_CHECKS = 75; // ~5 minutes, same as the subscription banner
+
+function readPending() {
+  try {
+    const rec = JSON.parse(localStorage.getItem(PENDING_KEY) || 'null');
+    if (rec && rec.bookingId && rec.token && Date.now() - rec.ts < PENDING_MAX_AGE_MS) return rec;
+  } catch { /* unavailable or corrupt */ }
+  return null;
+}
+function writePending(rec) { try { localStorage.setItem(PENDING_KEY, JSON.stringify({ ...rec, ts: Date.now() })); } catch { /* ignore */ } }
+function clearPending() { try { localStorage.removeItem(PENDING_KEY); } catch { /* ignore */ } }
 
 // ── Neutral palette constants ─────────────────────────────────────────────────
 const N = {
@@ -272,7 +300,7 @@ export default function PublicView({
   const [galleryLoading,  setGalleryLoading]  = useState(true);
 
   const [form, setForm] = useState({
-    client_name: '', client_phone: '', service_name: '',
+    client_name: '', client_phone: '', client_email: '', service_name: '', service_id: '',
     price: 0, date: '', time: '', ampm: 'AM', notes: '',
   });
   const [formLoading, setFormLoading] = useState(false);
@@ -280,6 +308,8 @@ export default function PublicView({
   const [formError,   setFormError]   = useState('');
   const [fieldErrors, setFieldErrors] = useState({});
   const [whatsappUrl, setWhatsappUrl] = useState(null);
+  // Pay-ahead flow: { phase: 'confirming' | 'confirmed' | 'expired' | 'timeout', record }
+  const [payFlow, setPayFlow] = useState(null);
 
   // ── Rating prompt (?rate={booking_id}) ──────────────────────────────────────
   const [ratingBookingId,  setRatingBookingId]  = useState(() =>
@@ -337,7 +367,7 @@ export default function PublicView({
       setBusiness(null); setServices([]); setGallery([]);
       setServicesLoading(true); setGalleryLoading(true); setLoadingBiz(true);
 
-      const cols = 'id,name,owner_name,tagline,business_type,avatar_url,whatsapp,custom_business_type,city,state,slug,avg_rating,rating_count,is_active';
+      const cols = 'id,name,owner_name,tagline,business_type,avatar_url,whatsapp,custom_business_type,city,state,slug,avg_rating,rating_count,is_active,payouts_enabled';
       const bizQuery = propBusinessId
         ? supabase.from('businesses_public').select(cols).eq('id', propBusinessId).single()
         : supabase.from('businesses_public').select(cols).limit(1).single();
@@ -357,7 +387,7 @@ export default function PublicView({
       );
 
       const [svcRes, galRes] = await Promise.all([
-        supabase.from('services').select('id,name,price,category')
+        supabase.from('services').select('id,name,price,category,payment_mode,deposit_type,deposit_value')
           .eq('business_id', biz.id).eq('active', true)
           .order('category').order('name'),
         supabase.from('gallery').select('id,image_url,caption')
@@ -376,6 +406,61 @@ export default function PublicView({
       );
     };
   }, [propBusinessId]);
+
+  // ── Pay-ahead: resume after returning from Paystack ────────────────────────
+  useEffect(() => {
+    if (!business?.id) return;
+    const rec = readPending();
+    if (rec && rec.businessId === business.id) {
+      // Syncing from localStorage (an external store) once the business is known.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPayFlow({ phase: 'confirming', record: rec });
+      setDrawerOpen(true);
+    }
+  }, [business?.id]);
+
+  // Coming back with the browser's Back button can restore this page from
+  // bfcache with the submit spinner still on.
+  useEffect(() => {
+    function onPageShow(e) {
+      if (!e.persisted) return;
+      setFormLoading(false);
+      const rec = readPending();
+      if (rec) { setPayFlow({ phase: 'confirming', record: rec }); setDrawerOpen(true); }
+    }
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
+
+  // The webhook is the source of truth for payment — never the redirect back.
+  // This only watches the booking (via booking-status) until it confirms.
+  const confirmingRecord = payFlow?.phase === 'confirming' ? payFlow.record : null;
+  useEffect(() => {
+    if (!confirmingRecord) return;
+    let stopped = false;
+    let checks = 0;
+    const timer = setInterval(check, POLL_INTERVAL_MS);
+    check();
+    async function check() {
+      checks += 1;
+      const { data } = await callFunction('booking-status', {
+        booking_id: confirmingRecord.bookingId, poll_token: confirmingRecord.token,
+      });
+      if (stopped) return;
+      if (data?.status === 'confirmed') {
+        stopped = true; clearInterval(timer); clearPending();
+        setPayFlow({ phase: 'confirmed', record: { ...confirmingRecord, amountPaid: data.amount_paid } });
+      } else if (data?.status === 'expired' || data?.status === 'cancelled') {
+        stopped = true; clearInterval(timer); clearPending();
+        setPayFlow({ phase: 'expired', record: confirmingRecord });
+      } else if (checks >= POLL_MAX_CHECKS) {
+        // Timing out is not failure — a bank transfer can still land later.
+        stopped = true; clearInterval(timer);
+        setPayFlow({ phase: 'timeout', record: confirmingRecord });
+      }
+    }
+    return () => { stopped = true; clearInterval(timer); };
+  }, [confirmingRecord]);
 
   // ── LocalBusiness JSON-LD structured data ───────────────────────────────────
   useEffect(() => {
@@ -421,7 +506,7 @@ export default function PublicView({
   function handleServiceCard(svc) {
     // price is a nullable column (see schema.sql) — match the <select>
     // handler below, which already guards this the same way.
-    setForm(f => ({ ...f, service_name: svc.name, price: svc.price ?? 0 }));
+    setForm(f => ({ ...f, service_name: svc.name, service_id: svc.id, price: svc.price ?? 0 }));
     setFieldErrors(fe => ({ ...fe, service_name: '' }));
   }
 
@@ -429,6 +514,15 @@ export default function PublicView({
     setForm(f => ({ ...f, time, ampm }));
     setFieldErrors(fe => ({ ...fe, time: '' }));
   }
+
+  // Pay-ahead applies only when the business has payouts set up AND this
+  // service asks for a deposit or full payment. Everything else keeps the
+  // original request-a-booking flow untouched. The amount shown here is for
+  // display; create-booking-payment recomputes it server-side.
+  const selectedSvc = services.find(s => s.id === form.service_id) ?? services.find(s => s.name === form.service_name) ?? null;
+  const payInfo = business?.payouts_enabled && selectedSvc && (selectedSvc.payment_mode ?? 'pay_at_venue') !== 'pay_at_venue'
+    ? computeAmountDue(selectedSvc)
+    : null;
 
   function validate() {
     const errors = {};
@@ -439,6 +533,7 @@ export default function PublicView({
     if (!form.service_name)             errors.service_name = 'Please select a service';
     if (!form.date)                     errors.date         = 'Please choose a date';
     if (!form.time.trim())              errors.time         = 'Please select a time';
+    if (payInfo && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(form.client_email.trim())) errors.client_email = 'A valid email is required for online payment';
     return errors;
   }
 
@@ -448,6 +543,37 @@ export default function PublicView({
     if (Object.keys(errors).length > 0) { setFieldErrors(errors); return; }
     if (!business?.id) { setFormError('Unable to submit. Please refresh and try again.'); return; }
     setFormLoading(true); setFormError('');
+
+    if (payInfo) {
+      const { data, error: payError } = await callFunction('create-booking-payment', {
+        business_id:  business.id,
+        service_id:   selectedSvc.id,
+        date:         form.date,
+        time:         form.time.trim(),
+        ampm:         form.ampm,
+        client_name:  form.client_name.trim(),
+        client_phone: form.client_phone.trim(),
+        client_email: form.client_email.trim(),
+        notes:        form.notes.trim(),
+      });
+      if (payError || !data?.authorization_url) {
+        setFormLoading(false);
+        setFormError(payError || 'Could not start the payment. Please try again.');
+        return;
+      }
+      writePending({
+        bookingId: data.booking_id, token: data.poll_token, businessId: business.id,
+        snapshot: {
+          client_name: form.client_name.trim(), client_phone: form.client_phone.trim(),
+          service_name: form.service_name, date: form.date, time: form.time.trim(), ampm: form.ampm,
+          notes: form.notes, amount_paid: data.amount_due_now, balance: data.balance,
+        },
+      });
+      track('booking_payment_started', { service_name: form.service_name, business_id: business.id, amount: data.amount_due_now });
+      // Leave the spinner on: the page is navigating to Paystack's checkout.
+      window.location.assign(data.authorization_url);
+      return;
+    }
 
     const { error } = await supabase.from('bookings').insert({
       business_id:  business.id,
@@ -470,7 +596,7 @@ export default function PublicView({
       track('booking_submitted', { service_name: form.service_name, business_id: business.id });
       const snapshot = { ...form };
       setFormSuccess(true);
-      setForm({ client_name: '', client_phone: '', service_name: '', price: 0, date: '', time: '', ampm: 'AM', notes: '' });
+      setForm({ client_name: '', client_phone: '', client_email: '', service_name: '', service_id: '', price: 0, date: '', time: '', ampm: 'AM', notes: '' });
       const waUrl = buildWhatsAppUrl(business.whatsapp, snapshot);
       if (waUrl) {
         setWhatsappUrl(waUrl);
@@ -593,7 +719,16 @@ export default function PublicView({
         </button>
       </div>
 
-      {formSuccess ? (
+      {payFlow ? (
+        <PaymentStatusPanel
+          flow={payFlow}
+          business={business}
+          theme={theme}
+          onRetryPolling={() => setPayFlow(f => ({ phase: 'confirming', record: f.record }))}
+          onReset={() => { clearPending(); setPayFlow(null); }}
+          onDone={() => { clearPending(); setPayFlow(null); setDrawerOpen(false); }}
+        />
+      ) : formSuccess ? (
         /* Success state — scrollable */
         <div className="flex-1 overflow-y-auto px-5 py-5"
           style={{ WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain' }}>
@@ -645,7 +780,7 @@ export default function PublicView({
                   <select style={{ ...IS.input, appearance: 'none' }} value={form.service_name}
                     onChange={e => {
                       const svc = services.find(s => s.name === e.target.value);
-                      setForm(f => ({ ...f, service_name: e.target.value, price: svc?.price ?? 0 }));
+                      setForm(f => ({ ...f, service_name: e.target.value, service_id: svc?.id ?? '', price: svc?.price ?? 0 }));
                       setFieldErrors(fe => ({ ...fe, service_name: '' }));
                     }}>
                     <option value="">Select a service…</option>
@@ -746,6 +881,42 @@ export default function PublicView({
                   value={form.notes} onChange={handleChange('notes')} />
               </div>
 
+              {/* Email — only needed (by Paystack) for paid services */}
+              {payInfo && (
+                <div>
+                  <label className="block text-xs font-bold uppercase tracking-wider mb-2 text-slate-400">
+                    Email <span className="normal-case tracking-normal font-normal text-slate-300">(for your payment receipt)</span>
+                  </label>
+                  <input style={{ ...IS.input, ...(fieldErrors.client_email ? IS.inputErr : {}) }}
+                    type="email" inputMode="email" autoComplete="email" placeholder="e.g. adaeze@email.com"
+                    value={form.client_email} onChange={handleChange('client_email')} />
+                  {fieldErrors.client_email && (
+                    <span className="flex items-center gap-1 text-red-400 text-xs mt-1">
+                      <AlertCircle size={11} />{fieldErrors.client_email}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* What you pay now vs later — shown before the customer commits */}
+              {payInfo && (
+                <div className="rounded-xl border px-4 py-3 text-sm" style={{ borderColor: N.border, background: '#F8FAFC' }}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500">Pay now</span>
+                    <span className="font-bold text-slate-900">₦{payInfo.dueNow.toLocaleString()}</span>
+                  </div>
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="text-slate-500">Balance at venue</span>
+                    <span className="font-semibold text-slate-700">
+                      {payInfo.balance > 0 ? `₦${payInfo.balance.toLocaleString()}` : 'Nothing — paid in full'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                    Payment goes directly to {business?.name ?? 'the business'}. Any refund is arranged directly with them.
+                  </p>
+                </div>
+              )}
+
               {formError && (
                 <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3 text-red-400 text-sm">
                   <AlertCircle size={14} className="flex-shrink-0" />{formError}
@@ -762,12 +933,14 @@ export default function PublicView({
               className="w-full py-4 rounded-xl font-bold text-base border-0 cursor-pointer flex items-center justify-center gap-2 disabled:opacity-70"
               style={{ background: theme.btnBg, color: theme.btnText }}>
               {formLoading
-                ? <><Loader2 size={16} className="pv-spin" /> Sending Request…</>
-                : 'Confirm Booking Request'
+                ? <><Loader2 size={16} className="pv-spin" /> {payInfo ? 'Taking you to payment…' : 'Sending Request…'}</>
+                : payInfo
+                  ? `Pay ₦${payInfo.dueNow.toLocaleString()} to book`
+                  : 'Confirm Booking Request'
               }
             </button>
             <p className="flex items-center justify-center gap-1 text-xs text-center text-slate-400 mt-2">
-              <Lock size={11} /> Your details are secure. Confirmation via WhatsApp.
+              <Lock size={11} /> {payInfo ? 'Secure payment by Paystack.' : 'Your details are secure. Confirmation via WhatsApp.'}
             </p>
           </div>
         </form>
@@ -1418,6 +1591,91 @@ export default function PublicView({
         </>
       )}
 
+    </div>
+  );
+}
+
+// ── Pay-ahead status panel ───────────────────────────────────────────────────
+// Shown after the customer returns from Paystack. Deliberately neutral while
+// "confirming": a bank transfer can settle minutes after the redirect, and
+// only the webhook (not this page) decides the booking is paid.
+
+function PaymentStatusPanel({ flow, business, theme, onRetryPolling, onReset, onDone }) {
+  const { phase, record } = flow;
+  const snap = record?.snapshot ?? {};
+  const waUrl = record?.snapshot ? buildWhatsAppUrl(business?.whatsapp, phase === 'confirmed' ? snap : { ...snap, amount_paid: 0 }) : null;
+  const bizName = business?.name ?? 'the business';
+
+  let icon; let title; let body; let actions;
+  if (phase === 'confirming') {
+    icon = <Loader2 size={32} className="pv-spin" style={{ color: theme.primary }} />;
+    title = 'Confirming your payment…';
+    body = 'This usually takes a few seconds. If you are paying by bank transfer it can take a few minutes — you can keep this page open.';
+    actions = (
+      <button onClick={onReset} className="text-xs font-medium text-slate-400 bg-transparent border-0 cursor-pointer underline">
+        Didn&apos;t pay? Start over
+      </button>
+    );
+  } else if (phase === 'confirmed') {
+    icon = <CheckCircle size={32} style={{ color: theme.primary }} strokeWidth={1.5} />;
+    title = 'Booking confirmed!';
+    body = `Your payment of ₦${Number(snap.amount_paid || record?.amountPaid || 0).toLocaleString()} was received.${snap.balance > 0 ? ` The remaining ₦${Number(snap.balance).toLocaleString()} is paid at the venue.` : ''} Payment goes directly to ${bizName}.`;
+    actions = (
+      <>
+        {waUrl && (
+          <a href={waUrl} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 bg-[#25D366] text-white text-sm font-semibold px-6 py-3 rounded-xl no-underline">
+            Send your details to {bizName} on WhatsApp
+          </a>
+        )}
+        <button onClick={onDone} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
+          style={{ background: theme.btnBg, color: theme.btnText }}>Done</button>
+      </>
+    );
+  } else if (phase === 'timeout') {
+    icon = <Loader2 size={32} style={{ color: theme.primary }} />;
+    title = 'Still confirming your payment';
+    body = `We haven't received confirmation yet. If you've paid, your booking will be confirmed shortly — you can also message ${bizName} to check.`;
+    actions = (
+      <>
+        <button onClick={onRetryPolling} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
+          style={{ background: theme.btnBg, color: theme.btnText }}>Check again</button>
+        {waUrl && (
+          <a href={waUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium no-underline" style={{ color: theme.primary }}>
+            Message {bizName} on WhatsApp
+          </a>
+        )}
+        <button onClick={onReset} className="text-xs font-medium text-slate-400 bg-transparent border-0 cursor-pointer underline">Start over</button>
+      </>
+    );
+  } else {
+    icon = <AlertCircle size={32} className="text-slate-400" />;
+    title = 'This payment window has ended';
+    body = `Your slot was held for a limited time. If you were charged, ${bizName} will see your payment and contact you. Otherwise you can book again.`;
+    actions = (
+      <>
+        <button onClick={onReset} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
+          style={{ background: theme.btnBg, color: theme.btnText }}>Book again</button>
+        {waUrl && (
+          <a href={waUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium no-underline" style={{ color: theme.primary }}>
+            Message {bizName} on WhatsApp
+          </a>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto px-5 py-5" style={{ WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain' }}>
+      <div className="flex flex-col items-center py-12 gap-4 text-center">
+        <div className="w-16 h-16 rounded-full flex items-center justify-center"
+          style={{ background: `${theme.primary}18`, border: `2px solid ${theme.primary}` }}>
+          {icon}
+        </div>
+        <h3 className="font-serif text-2xl font-medium text-slate-900">{title}</h3>
+        <p className="text-sm leading-relaxed max-w-xs text-slate-500">{body}</p>
+        {actions}
+      </div>
     </div>
   );
 }

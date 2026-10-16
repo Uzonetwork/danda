@@ -13,3 +13,15 @@
 # function) until someone checked the platform logs specifically.
 [functions.paystack-webhook]
 verify_jwt = false
+
+# create-booking-payment and booking-status are called from the public
+# booking page by visitors who have no Supabase session. They authenticate
+# nothing by JWT: create-booking-payment validates everything server-side
+# (amount from the services row, per-phone hold cap, slot unique index) and
+# booking-status requires the random poll token create-booking-payment
+# returned. setup-payout-account is owner-only and keeps the default JWT gate.
+[functions.create-booking-payment]
+verify_jwt = false
+
+[functions.booking-status]
+verify_jwt = false
