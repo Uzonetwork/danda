@@ -229,14 +229,15 @@ create trigger bookings_lock_payment_columns
   before insert or update on bookings
   for each row execute function lock_booking_payment_columns();
 
--- Anon insert: same shape as before, plus status must be 'pending'. The
--- trigger above does the column-level work (a policy can't see defaults
--- uniformly). The existing PublicView payload (status:'pending', no payment
--- fields) passes both.
+-- Public insert (anon + authenticated, so a logged-in owner or customer
+-- browsing a booking page isn't blocked): same shape as before, plus status
+-- must be 'pending'. The trigger above does the column-level work (a policy
+-- can't see defaults uniformly) and applies to both roles. The existing
+-- PublicView payload (status:'pending', no payment fields) passes both.
 drop policy if exists "Public insert bookings" on bookings;
 create policy "Public insert bookings"
   on bookings for insert
-  to anon
+  to anon, authenticated
   with check (coalesce(status, 'pending') = 'pending');
 
 -- ─── 5. Realtime ─────────────────────────────────────────────────────────
