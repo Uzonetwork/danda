@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Fragment } from 'react';
 import {
   Calendar, Scissors, Users, Image as ImageIcon,
   LogOut, Plus, Pencil, Trash2, Check, X, Upload, User, Loader2, ChevronDown,
@@ -13,6 +13,8 @@ import { reminderMessage } from '../lib/reminderMessages';
 import { useCopyToClipboard } from '../lib/useCopyToClipboard';
 import SabiLogo from '../components/SabiLogo';
 import PayoutSetup from '../components/PayoutSetup';
+import PaymentSettingsFields from '../components/PaymentSettingsFields';
+import { validatePaymentSettings, describePayment } from '../lib/bookingPayment';
 import { openPaystackPopup, buildPaystackReference } from '../components/PaystackPayment';
 import { isSubscriptionActive, daysUntilExpiry } from '../lib/payments';
 import { PRICING } from '../config/pricing';
@@ -69,6 +71,8 @@ function buildActivationSupportMessage(businessName, reference) {
 
 // ── Shared input style ────────────────────────────────────────────────────────
 
+const DEFAULT_SVC_PAYMENT = { payment_mode: 'pay_at_venue', deposit_type: 'fixed', deposit_value: '' };
+
 const inputCls = 'bg-sabi-dark border border-sabi-border rounded-lg px-3 py-2 text-white text-sm placeholder:text-sabi-muted outline-none focus:border-sabi-green transition-colors';
 const selectCls = `${inputCls} cursor-pointer`;
 
@@ -84,8 +88,9 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
   const [editingId,      setEditingId]      = useState(null);
   const [editDraft,      setEditDraft]      = useState({});
   const [addingService,  setAddingService]  = useState(false);
-  const [newSvc,         setNewSvc]         = useState({ name: '', category: 'nails', price: '' });
+  const [newSvc,         setNewSvc]         = useState({ name: '', category: 'nails', price: '', ...DEFAULT_SVC_PAYMENT });
   const [svcError,       setSvcError]       = useState('');
+  const [svcEditError,   setSvcEditError]   = useState('');
   const [clients,        setClients]        = useState([]);
   const [clientsLoading, setClientsLoading] = useState(true);
   const [gallery,        setGallery]        = useState([]);
@@ -317,14 +322,42 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
     if (error) setBookings(bs => bs.map(b => b.id === id ? { ...b, reminder_sent_at: previous } : b));
   }
 
-  function startEdit(svc) { setEditingId(svc.id); setEditDraft({ name: svc.name, category: svc.category, price: String(svc.price) }); }
+  function startEdit(svc) {
+    setSvcEditError('');
+    setEditingId(svc.id);
+    setEditDraft({
+      name: svc.name, category: svc.category, price: String(svc.price),
+      payment_mode: svc.payment_mode ?? 'pay_at_venue',
+      deposit_type: svc.deposit_type ?? 'fixed',
+      deposit_value: svc.deposit_value != null ? String(svc.deposit_value) : '',
+    });
+  }
+  // Only the columns that apply to the chosen mode are written; the others
+  // are nulled so the DB CHECK (see add_booking_payments.sql) can't trip on
+  // stale deposit values left over from a previous mode.
+  function paymentPatch(draft) {
+    const mode = draft.payment_mode ?? 'pay_at_venue';
+    return {
+      payment_mode: mode,
+      deposit_type: mode === 'deposit' ? draft.deposit_type : null,
+      deposit_value: mode === 'deposit' ? parseInt(draft.deposit_value, 10) : null,
+    };
+  }
   async function saveEdit(id) {
     const price = parseInt(editDraft.price, 10);
     if (!editDraft.name?.trim() || isNaN(price) || price <= 0) return;
-    const patch = { name: editDraft.name.trim(), category: editDraft.category, price };
+    const payErr = validatePaymentSettings(editDraft, price);
+    if (payErr) { setSvcEditError(payErr); return; }
+    const patch = { name: editDraft.name.trim(), category: editDraft.category, price, ...paymentPatch(editDraft) };
+    const previous = services.find(s => s.id === id);
+    setSvcEditError('');
     setServices(ss => ss.map(s => s.id === id ? { ...s, ...patch } : s));
     setEditingId(null);
-    await supabase.from('services').update(patch).eq('id', id);
+    const { error } = await supabase.from('services').update(patch).eq('id', id);
+    if (error) {
+      setServices(ss => ss.map(s => s.id === id ? previous : s));
+      setSvcEditError('Could not save changes. If you lowered the price, lower the deposit too.');
+    }
   }
   async function toggleActive(id, current) {
     setServices(ss => ss.map(s => s.id === id ? { ...s, active: !current } : s));
@@ -336,11 +369,13 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
     const price = parseInt(newSvc.price, 10);
     if (!newSvc.name.trim()) return setSvcError('Service name is required');
     if (isNaN(price) || price <= 0) return setSvcError('Enter a valid price');
-    const { data, error } = await supabase.from('services').insert({ business_id: businessId, name: newSvc.name.trim(), category: newSvc.category, price, active: true }).select().single();
+    const payErr = validatePaymentSettings(newSvc, price);
+    if (payErr) return setSvcError(payErr);
+    const { data, error } = await supabase.from('services').insert({ business_id: businessId, name: newSvc.name.trim(), category: newSvc.category, price, active: true, ...paymentPatch(newSvc) }).select().single();
     if (error) return setSvcError('Could not save service');
     track('service_added', { service_name: data.name, category: data.category, business_id: businessId });
     setServices(ss => [...ss, data]);
-    setNewSvc({ name: '', category: categoryOptions[0][0], price: '' });
+    setNewSvc({ name: '', category: categoryOptions[0][0], price: '', ...DEFAULT_SVC_PAYMENT });
     setAddingService(false);
   }
 
@@ -702,13 +737,16 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                   {categoryOptions.map(([val, label]) => <option key={val} value={val}>{label}</option>)}
                 </select>
                 <input className={inputCls} placeholder="Price (₦)" type="number" min="0" value={newSvc.price} onChange={e => { setNewSvc(n => ({ ...n, price: e.target.value })); setSvcError(''); }} />
+                <PaymentSettingsFields value={newSvc} onChange={v => { setNewSvc(n => ({ ...n, ...v })); setSvcError(''); }} price={newSvc.price} payoutsEnabled={payout.enabled} />
                 <div className="flex items-center gap-2 flex-wrap">
                   {svcError && <span className="text-red-400 text-xs flex-1">{svcError}</span>}
                   <button className="bg-sabi-gold text-sabi-dark text-xs font-black px-4 py-1.5 rounded-lg border-0 cursor-pointer" onClick={submitNewService}>Save</button>
-                  <button className="text-sabi-muted text-xs font-semibold px-4 py-1.5 rounded-lg border border-sabi-border bg-transparent cursor-pointer hover:text-white transition-colors" onClick={() => { setAddingService(false); setSvcError(''); setNewSvc({ name: '', category: categoryOptions[0][0], price: '' }); }}>Cancel</button>
+                  <button className="text-sabi-muted text-xs font-semibold px-4 py-1.5 rounded-lg border border-sabi-border bg-transparent cursor-pointer hover:text-white transition-colors" onClick={() => { setAddingService(false); setSvcError(''); setNewSvc({ name: '', category: categoryOptions[0][0], price: '', ...DEFAULT_SVC_PAYMENT }); }}>Cancel</button>
                 </div>
               </div>
             )}
+
+            {svcEditError && <p className="text-red-400 text-xs mb-3">{svcEditError}</p>}
 
             {servicesLoading ? <SkeletonList count={7} height={48} /> : (
               <div className="bg-sabi-card border border-sabi-border rounded-xl overflow-hidden">
@@ -716,8 +754,8 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                   <table className="w-full text-sm border-collapse">
                     <thead className="bg-sabi-deep">
                       <tr>
-                        {['Service', 'Category', 'Price', 'Active', ''].map((h, i) => (
-                          <th key={i} className={`px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-sabi-muted ${i === 4 ? 'text-right' : ''}`}>{h}</th>
+                        {['Service', 'Category', 'Price', 'Payment', 'Active', ''].map((h, i) => (
+                          <th key={i} className={`px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-sabi-muted ${i === 5 ? 'text-right' : ''}`}>{h}</th>
                         ))}
                       </tr>
                     </thead>
@@ -725,7 +763,8 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                       {services.map(svc => {
                         const isEditing = editingId === svc.id;
                         return (
-                          <tr key={svc.id} className="border-t border-sabi-border/50 hover:bg-sabi-deep/30 transition-colors">
+                          <Fragment key={svc.id}>
+                          <tr className="border-t border-sabi-border/50 hover:bg-sabi-deep/30 transition-colors">
                             <td className="px-4 py-3">
                               {isEditing
                                 ? <input className={`${inputCls} text-xs`} value={editDraft.name} autoFocus onChange={e => setEditDraft(d => ({ ...d, name: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') saveEdit(svc.id); if (e.key === 'Escape') setEditingId(null); }} />
@@ -743,6 +782,9 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                                 ? <input className={`${inputCls} text-xs w-24`} type="number" min="0" value={editDraft.price} onChange={e => setEditDraft(d => ({ ...d, price: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') saveEdit(svc.id); if (e.key === 'Escape') setEditingId(null); }} />
                                 : <span className="text-sabi-gold font-semibold">₦{(svc.price || 0).toLocaleString()}</span>
                               }
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className={`text-xs whitespace-nowrap ${(svc.payment_mode ?? 'pay_at_venue') === 'pay_at_venue' ? 'text-sabi-muted' : 'text-sabi-gold font-semibold'}`}>{describePayment(svc)}</span>
                             </td>
                             <td className="px-4 py-3">
                               <button className={`od-toggle ${svc.active ? 'od-toggle--on' : ''}`} onClick={() => toggleActive(svc.id, svc.active)} title={svc.active ? 'Active' : 'Inactive'}>
@@ -765,10 +807,18 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                               </div>
                             </td>
                           </tr>
+                          {isEditing && (
+                            <tr className="bg-sabi-deep/30">
+                              <td colSpan={6} className="px-4 pb-4 pt-1">
+                                <PaymentSettingsFields value={editDraft} onChange={v => setEditDraft(d => ({ ...d, ...v }))} price={editDraft.price} payoutsEnabled={payout.enabled} />
+                              </td>
+                            </tr>
+                          )}
+                          </Fragment>
                         );
                       })}
                       {services.length === 0 && !servicesLoading && (
-                        <tr><td colSpan={5} className="px-4 py-12 text-center text-sabi-muted text-sm">No services yet</td></tr>
+                        <tr><td colSpan={6} className="px-4 py-12 text-center text-sabi-muted text-sm">No services yet</td></tr>
                       )}
                     </tbody>
                   </table>
