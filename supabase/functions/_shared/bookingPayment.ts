@@ -36,7 +36,7 @@ export async function handleBookingCharge(
 
   const { data: booking, error: lookupError } = await DB
     .from('bookings')
-    .select('id, business_id, client_name, client_phone, service_name, date, status, payment_status, amount_due_now')
+    .select('id, business_id, client_name, client_phone, service_name, date, status, payment_status, amount_due_now, paystack_reference')
     .eq('paystack_reference', reference)
     .maybeSingle();
   if (lookupError) {
@@ -55,8 +55,23 @@ export async function handleBookingCharge(
     console.error('[bookingPayment] verify call failed:', verified.json);
     return { retry: true, note: 'verify failed' };
   }
-  const tx = verified.json.data;
+  return applyVerifiedTransaction(DB, booking, verified.json.data);
+}
 
+// The single confirm path, shared by the webhook (handleBookingCharge) and the
+// customer's booking-status poll (verifyAndConfirmBooking). Takes a transaction
+// that was fetched from Paystack's verify endpoint — never a webhook body —
+// and applies the amount/currency/subaccount/booking checks and the atomic
+// `payment_status = 'unpaid'` idempotency guard. Whichever caller gets there
+// first confirms; the other becomes a no-op.
+async function applyVerifiedTransaction(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  DB: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  booking: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+): Promise<BookingChargeResult> {
   const { data: biz, error: bizError } = await DB
     .from('businesses')
     .select('id, paystack_subaccount_code')
@@ -75,7 +90,7 @@ export async function handleBookingCharge(
   if (tx?.metadata?.booking_id !== booking.id) problems.push('booking_id mismatch');
   if (problems.length > 0) {
     // Permanent condition — retrying won't fix it. Left unconfirmed on purpose.
-    console.error('[bookingPayment] verification mismatch for', reference, problems.join('; '));
+    console.error('[bookingPayment] verification mismatch for', booking.paystack_reference, problems.join('; '));
     return { retry: false, note: 'verification mismatch' };
   }
 
@@ -105,6 +120,44 @@ export async function handleBookingCharge(
 
   await upsertClient(DB, booking);
   return { retry: false, note: 'confirmed' };
+}
+
+export type ActiveVerifyOutcome = 'confirmed' | 'not_paid' | 'pending';
+
+/**
+ * Customer-facing active verification, used by booking-status while a booking
+ * is still pending_payment. Asks Paystack about the booking's reference and:
+ *   success            → same confirm logic as the webhook → 'confirmed'
+ *   abandoned / failed / reference unknown → 'not_paid'
+ *   pending / ongoing / anything uncertain → 'pending'
+ * Uncertain (network error, Paystack 5xx, failed safety checks) maps to
+ * 'pending', never 'not_paid': telling a customer who may have paid that we
+ * haven't got their money is the worse mistake, and the webhook is the backup.
+ */
+export async function verifyAndConfirmBooking(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  DB: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  booking: any,
+  secret: string,
+): Promise<ActiveVerifyOutcome> {
+  const reference = String(booking.paystack_reference ?? '');
+  if (!reference.startsWith(BOOKING_REFERENCE_PREFIX)) return 'pending';
+
+  const verified = await paystack(secret, `/transaction/verify/${encodeURIComponent(reference)}`);
+  if (!verified.ok) {
+    // Paystack answers an unknown reference with status:false "...not found".
+    if (verified.json?.status === false && /not found/i.test(String(verified.json?.message ?? ''))) return 'not_paid';
+    console.error('[bookingPayment] active verify failed:', verified.json);
+    return 'pending';
+  }
+  const txStatus = verified.json.data?.status;
+  if (txStatus === 'abandoned' || txStatus === 'failed' || txStatus === 'reversed') return 'not_paid';
+  if (txStatus !== 'success') return 'pending'; // pending / ongoing / processing / queued
+
+  const result = await applyVerifiedTransaction(DB, booking, verified.json.data);
+  if (result.retry || (result.note !== 'confirmed' && result.note !== 'already processed')) return 'pending';
+  return 'confirmed';
 }
 
 // Mirrors the client upsert OwnerDashboard.setBookingStatus does when an

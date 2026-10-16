@@ -58,6 +58,7 @@ alter table bookings drop column if exists hold_expires_at;
 alter table bookings drop column if exists needs_attention;
 alter table bookings drop column if exists attention_resolved_at;
 alter table bookings drop column if exists poll_token_hash;
+alter table bookings drop column if exists last_verify_at;
 
 -- Any rows left in the migration's states have no meaning without the
 -- payment columns; return them to a state the old app understands.

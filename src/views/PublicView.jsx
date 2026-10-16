@@ -249,8 +249,8 @@ const TIME_SLOTS = [
 // through the webhook.
 const PENDING_KEY = 'danda_pending_booking';
 const PENDING_MAX_AGE_MS = 45 * 60 * 1000; // hold (30 min) + margin
-const POLL_INTERVAL_MS = 4000;
-const POLL_MAX_CHECKS = 75; // ~5 minutes, same as the subscription banner
+const POLL_INTERVAL_MS = 3000;
+const POLL_MAX_MS = 60 * 1000; // booking-status actively verifies with Paystack, so ~1 minute is enough
 
 function readPending() {
   try {
@@ -308,8 +308,9 @@ export default function PublicView({
   const [formError,   setFormError]   = useState('');
   const [fieldErrors, setFieldErrors] = useState({});
   const [whatsappUrl, setWhatsappUrl] = useState(null);
-  // Pay-ahead flow: { phase: 'confirming' | 'confirmed' | 'expired' | 'timeout', record }
+  // Pay-ahead flow: { phase: 'confirming' | 'confirmed' | 'not_paid' | 'expired' | 'timeout', record }
   const [payFlow, setPayFlow] = useState(null);
+  const [rechecking, setRechecking] = useState(false);
 
   // ── Rating prompt (?rate={booking_id}) ──────────────────────────────────────
   const [ratingBookingId,  setRatingBookingId]  = useState(() =>
@@ -432,28 +433,44 @@ export default function PublicView({
     return () => window.removeEventListener('pageshow', onPageShow);
   }, []);
 
-  // The webhook is the source of truth for payment — never the redirect back.
-  // This only watches the booking (via booking-status) until it confirms.
+  // booking-status actively verifies with Paystack (the webhook is the backup
+  // path), so the customer normally gets an answer within seconds.
+  // Maps one booking-status answer onto the screen. Returns true when polling
+  // should stop. 'pending' is not terminal here — the caller decides on timeout.
+  function applyBookingStatus(data, record) {
+    if (data?.status === 'confirmed') {
+      clearPending();
+      setPayFlow({ phase: 'confirmed', record: { ...record, amountPaid: data.amount_paid } });
+      return true;
+    }
+    if (data?.status === 'expired' || data?.status === 'cancelled') {
+      clearPending(); // hold lapsed: the stored poll token is no use any more
+      setPayFlow({ phase: 'expired', record });
+      return true;
+    }
+    if (data?.status === 'not_paid') {
+      // Keep the stored record so "Pay now" still works after a reload.
+      setPayFlow({ phase: 'not_paid', record });
+      return true;
+    }
+    return false;
+  }
+
   const confirmingRecord = payFlow?.phase === 'confirming' ? payFlow.record : null;
   useEffect(() => {
     if (!confirmingRecord) return;
     let stopped = false;
-    let checks = 0;
+    const startedAt = Date.now();
     const timer = setInterval(check, POLL_INTERVAL_MS);
     check();
     async function check() {
-      checks += 1;
       const { data } = await callFunction('booking-status', {
         booking_id: confirmingRecord.bookingId, poll_token: confirmingRecord.token,
       });
       if (stopped) return;
-      if (data?.status === 'confirmed') {
-        stopped = true; clearInterval(timer); clearPending();
-        setPayFlow({ phase: 'confirmed', record: { ...confirmingRecord, amountPaid: data.amount_paid } });
-      } else if (data?.status === 'expired' || data?.status === 'cancelled') {
-        stopped = true; clearInterval(timer); clearPending();
-        setPayFlow({ phase: 'expired', record: confirmingRecord });
-      } else if (checks >= POLL_MAX_CHECKS) {
+      if (applyBookingStatus(data, confirmingRecord)) {
+        stopped = true; clearInterval(timer);
+      } else if (Date.now() - startedAt >= POLL_MAX_MS) {
         // Timing out is not failure — a bank transfer can still land later.
         stopped = true; clearInterval(timer);
         setPayFlow({ phase: 'timeout', record: confirmingRecord });
@@ -461,6 +478,22 @@ export default function PublicView({
     }
     return () => { stopped = true; clearInterval(timer); };
   }, [confirmingRecord]);
+
+  // "Check again": one more active verification right now, not another long poll.
+  async function recheckPayment() {
+    const record = payFlow?.record;
+    if (!record || rechecking) return;
+    setRechecking(true);
+    const { data } = await callFunction('booking-status', { booking_id: record.bookingId, poll_token: record.token });
+    setRechecking(false);
+    applyBookingStatus(data, record);
+  }
+
+  // "Pay now": continue the same Paystack transaction while the hold is valid.
+  function payNow() {
+    const url = payFlow?.record?.authorizationUrl;
+    if (url) window.location.assign(url);
+  }
 
   // ── LocalBusiness JSON-LD structured data ───────────────────────────────────
   useEffect(() => {
@@ -563,6 +596,7 @@ export default function PublicView({
       }
       writePending({
         bookingId: data.booking_id, token: data.poll_token, businessId: business.id,
+        authorizationUrl: data.authorization_url,
         snapshot: {
           client_name: form.client_name.trim(), client_phone: form.client_phone.trim(),
           service_name: form.service_name, date: form.date, time: form.time.trim(), ampm: form.ampm,
@@ -724,7 +758,9 @@ export default function PublicView({
           flow={payFlow}
           business={business}
           theme={theme}
-          onRetryPolling={() => setPayFlow(f => ({ phase: 'confirming', record: f.record }))}
+          checking={rechecking}
+          onCheckAgain={recheckPayment}
+          onPayNow={payNow}
           onReset={() => { clearPending(); setPayFlow(null); }}
           onDone={() => { clearPending(); setPayFlow(null); setDrawerOpen(false); }}
         />
@@ -1600,7 +1636,7 @@ export default function PublicView({
 // "confirming": a bank transfer can settle minutes after the redirect, and
 // only the webhook (not this page) decides the booking is paid.
 
-function PaymentStatusPanel({ flow, business, theme, onRetryPolling, onReset, onDone }) {
+function PaymentStatusPanel({ flow, business, theme, checking, onCheckAgain, onPayNow, onReset, onDone }) {
   const { phase, record } = flow;
   const snap = record?.snapshot ?? {};
   const waUrl = record?.snapshot ? buildWhatsAppUrl(business?.whatsapp, phase === 'confirmed' ? snap : { ...snap, amount_paid: 0 }) : null;
@@ -1632,26 +1668,38 @@ function PaymentStatusPanel({ flow, business, theme, onRetryPolling, onReset, on
           style={{ background: theme.btnBg, color: theme.btnText }}>Done</button>
       </>
     );
-  } else if (phase === 'timeout') {
-    icon = <Loader2 size={32} style={{ color: theme.primary }} />;
-    title = 'Still confirming your payment';
-    body = `We haven't received confirmation yet. If you've paid, your booking will be confirmed shortly — you can also message ${bizName} to check.`;
+  } else if (phase === 'not_paid') {
+    icon = <AlertCircle size={32} className="text-slate-400" />;
+    title = "We haven't received your payment";
+    body = 'Your slot is still held for a short while. You can pick up where you left off, or start over.';
     actions = (
       <>
-        <button onClick={onRetryPolling} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
-          style={{ background: theme.btnBg, color: theme.btnText }}>Check again</button>
+        {record?.authorizationUrl && (
+          <button onClick={onPayNow} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
+            style={{ background: theme.btnBg, color: theme.btnText }}>Pay now</button>
+        )}
+        <button onClick={onReset} className="px-6 py-3 rounded-xl font-bold text-sm border border-slate-200 bg-white text-slate-700 cursor-pointer">Start over</button>
+      </>
+    );
+  } else if (phase === 'timeout') {
+    icon = <Loader2 size={32} style={{ color: theme.primary }} />;
+    title = 'Your transfer is still processing';
+    body = `Bank transfers can take a few minutes. You don't need to do anything — your booking will be confirmed automatically once ${bizName} receives the payment.`;
+    actions = (
+      <>
+        <button onClick={onCheckAgain} disabled={checking} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer disabled:opacity-60"
+          style={{ background: theme.btnBg, color: theme.btnText }}>{checking ? 'Checking…' : 'Check again'}</button>
         {waUrl && (
           <a href={waUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium no-underline" style={{ color: theme.primary }}>
             Message {bizName} on WhatsApp
           </a>
         )}
-        <button onClick={onReset} className="text-xs font-medium text-slate-400 bg-transparent border-0 cursor-pointer underline">Start over</button>
       </>
     );
   } else {
     icon = <AlertCircle size={32} className="text-slate-400" />;
-    title = 'This payment window has ended';
-    body = `Your slot was held for a limited time. If you were charged, ${bizName} will see your payment and contact you. Otherwise you can book again.`;
+    title = 'Payment not completed';
+    body = `This time slot has been released. If you were charged, ${bizName} will see your payment and contact you.`;
     actions = (
       <>
         <button onClick={onReset} className="px-6 py-3 rounded-xl font-bold text-sm border-0 cursor-pointer"
