@@ -12,6 +12,7 @@ import { normalizeNgPhone } from '../lib/phone';
 import { reminderMessage } from '../lib/reminderMessages';
 import { useCopyToClipboard } from '../lib/useCopyToClipboard';
 import SabiLogo from '../components/SabiLogo';
+import PayoutSetup from '../components/PayoutSetup';
 import { openPaystackPopup, buildPaystackReference } from '../components/PaystackPayment';
 import { isSubscriptionActive, daysUntilExpiry } from '../lib/payments';
 import { PRICING } from '../config/pricing';
@@ -110,6 +111,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
   const [showEarningsHistory, setShowEarningsHistory] = useState(false);
   const [settings,       setSettings]       = useState({ name: '', owner_name: '', tagline: '', whatsapp: '' });
   const [savedSettings,  setSavedSettings]  = useState({ name: '', owner_name: '', tagline: '', whatsapp: '' });
+  const [payout,         setPayout]         = useState({ enabled: false });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsSuccess,setSettingsSuccess]= useState(false);
   const [settingsError,  setSettingsError]  = useState('');
@@ -247,7 +249,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
         supabase.from('services').select('*').eq('business_id', businessId).order('category').order('name'),
         supabase.from('clients').select('*').eq('business_id', businessId).order('visit_count', { ascending: false }),
         supabase.from('gallery').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
-        supabase.from('businesses').select('avatar_url, business_type, name, owner_name, tagline, whatsapp, subscription_status, plan_expires_at, slug').eq('id', businessId).single(),
+        supabase.from('businesses').select('avatar_url, business_type, name, owner_name, tagline, whatsapp, subscription_status, plan_expires_at, slug, payouts_enabled, payout_bank_name, payout_bank_code, payout_account_last4, payout_account_name').eq('id', businessId).single(),
       ]);
       setBookings(bRes.data || []);       setBookingsLoading(false);
       setServices(sRes.data || []);       setServicesLoading(false);
@@ -267,6 +269,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
         setSubStatus(biz.subscription_status ?? 'inactive');
         setSubExpiresAt(biz.plan_expires_at ?? null);
         setBizSlug(biz.slug ?? '');
+        setPayout({ enabled: !!biz.payouts_enabled, bank_name: biz.payout_bank_name, bank_code: biz.payout_bank_code, account_last4: biz.payout_account_last4, account_name: biz.payout_account_name });
         setBizLoaded(true);
       }
     }
@@ -892,6 +895,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
                 </p>
               )}
             </div>
+            <PayoutSetup businessId={businessId} payout={payout} onSaved={setPayout} />
           </div>
         )}
 
