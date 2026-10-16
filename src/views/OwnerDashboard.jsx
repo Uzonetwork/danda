@@ -71,6 +71,11 @@ function buildActivationSupportMessage(businessName, reference) {
 
 // ── Shared input style ────────────────────────────────────────────────────────
 
+// System-managed booking states: an unpaid checkout hold, and a hold that
+// lapsed. An abandoned checkout isn't a booking, so neither is listed.
+const HIDDEN_BOOKING_STATUSES = ['pending_payment', 'expired'];
+const isListedBooking = b => !HIDDEN_BOOKING_STATUSES.includes(b.status);
+
 const DEFAULT_SVC_PAYMENT = { payment_mode: 'pay_at_venue', deposit_type: 'fixed', deposit_value: '' };
 
 const inputCls = 'bg-sabi-dark border border-sabi-border rounded-lg px-3 py-2 text-white text-sm placeholder:text-sabi-muted outline-none focus:border-sabi-green transition-colors';
@@ -133,6 +138,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
   const tomorrowStr = `${_tomorrow.getFullYear()}-${String(_tomorrow.getMonth()+1).padStart(2,'0')}-${String(_tomorrow.getDate()).padStart(2,'0')}`;
   const currentMonth = today.slice(0, 7);
   const confirmed = bookings.filter(b => b.status === 'confirmed');
+  const needsAttention = bookings.filter(b => b.needs_attention && !b.attention_resolved_at && b.status !== 'cancelled');
   const todayEarnings   = confirmed.filter(b => b.date === today).reduce((s, b) => s + (b.price || 0), 0);
   const monthlyEarnings = confirmed.filter(b => typeof b.date === 'string' && b.date.startsWith(currentMonth)).reduce((s, b) => s + (b.price || 0), 0);
   const lifetimeEarnings = confirmed.reduce((s, b) => s + (b.price || 0), 0);
@@ -256,7 +262,7 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
         supabase.from('gallery').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
         supabase.from('businesses').select('avatar_url, business_type, name, owner_name, tagline, whatsapp, subscription_status, plan_expires_at, slug, payouts_enabled, payout_bank_name, payout_bank_code, payout_account_last4, payout_account_name').eq('id', businessId).single(),
       ]);
-      setBookings(bRes.data || []);       setBookingsLoading(false);
+      setBookings((bRes.data || []).filter(isListedBooking));       setBookingsLoading(false);
       setServices(sRes.data || []);       setServicesLoading(false);
       setClients(cRes.data || []);        setClientsLoading(false);
       setGallery(gRes.data || []);        setGalleryLoading(false);
@@ -279,7 +285,19 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
       }
     }
     loadAll();
-    const channel = supabase.channel(`bookings-${businessId}`).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'bookings', filter: `business_id=eq.${businessId}` }, (payload) => setBookings(prev => [payload.new, ...prev])).subscribe();
+    // INSERT for new requests; UPDATE so a booking the paystack-webhook
+    // confirms (or flags needs_attention) shows up live. Requires bookings in
+    // the supabase_realtime publication (add_booking_payments.sql). Hidden
+    // states are dropped, so a held-but-unpaid checkout never flashes in.
+    const channel = supabase.channel(`bookings-${businessId}`).on('postgres_changes', { event: '*', schema: 'public', table: 'bookings', filter: `business_id=eq.${businessId}` }, (payload) => {
+      if (payload.eventType === 'DELETE') return;
+      const row = payload.new;
+      setBookings(prev => {
+        const rest = prev.filter(b => b.id !== row.id);
+        if (!isListedBooking(row)) return rest;
+        return rest.length !== prev.length ? prev.map(b => (b.id === row.id ? row : b)) : [row, ...prev];
+      });
+    }).subscribe();
     return () => supabase.removeChannel(channel);
   }, [businessId]);
 
@@ -303,6 +321,15 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
       const { data: newClient, error: insertErr } = await supabase.from('clients').insert({ business_id: businessId, name: client_name, phone: client_phone, initials, visit_count: 1, last_service: service_name, last_visit: date }).select().single();
       if (!insertErr && newClient) setClients(cs => [newClient, ...cs]);
     }
+  }
+
+  // Dismisses the "paid but clashed" card. Writes attention_resolved_at (owner-
+  // writable) rather than touching needs_attention, which is service-role only.
+  async function resolveAttention(id) {
+    const nowIso = new Date().toISOString();
+    setBookings(bs => bs.map(b => b.id === id ? { ...b, attention_resolved_at: nowIso } : b));
+    const { error } = await supabase.from('bookings').update({ attention_resolved_at: nowIso }).eq('id', id);
+    if (error) setBookings(bs => bs.map(b => b.id === id ? { ...b, attention_resolved_at: null } : b));
   }
 
   async function removeBooking(id) {
@@ -585,6 +612,15 @@ export default function OwnerDashboard({ businessId, onLogout, onViewPublicPage 
         {/* ── BOOKINGS ─────────────────────────────────────────── */}
         {activeTab === 'bookings' && (
           <div className="flex flex-col gap-6">
+
+            {/* Paid bookings whose time clashed — money already received */}
+            {needsAttention.length > 0 && (
+              <div className="flex flex-col gap-3">
+                {needsAttention.map(b => (
+                  <AttentionCard key={b.id} booking={b} onResolve={resolveAttention} fmtDate={fmtDate} businessName={settings.name} />
+                ))}
+              </div>
+            )}
 
             {/* Booking link — permanent, always visible */}
             {bookingLink && (
@@ -1016,6 +1052,51 @@ function EmptyState({ icon, text }) {
   );
 }
 
+// What the client has paid, as shown on a booking card. Records only —
+// refunds are agreed directly between the business and the client.
+function paymentBadge(b) {
+  if (b.payment_status === 'paid') {
+    const paid = Number(b.amount_paid) || 0;
+    const due = Math.max((Number(b.price) || 0) - paid, 0);
+    return due > 0
+      ? { paid: true, label: `Deposit paid ₦${paid.toLocaleString()}, ₦${due.toLocaleString()} due at venue` }
+      : { paid: true, label: 'Paid in full' };
+  }
+  return { paid: false, label: 'Pay at venue' };
+}
+
+function AttentionCard({ booking, onResolve, fmtDate, businessName }) {
+  const { id, client_name, client_phone, service_name, date, time, ampm, amount_paid } = booking;
+  const waNumber = normalizeNgPhone(client_phone);
+  const when = `${fmtDate(date)}${time ? ` · ${time} ${ampm}` : ''}`;
+  const message = `Hi ${client_name}, this is ${businessName || 'your service provider'}. Thank you for your payment of ₦${(Number(amount_paid) || 0).toLocaleString()} for ${service_name} on ${when}. Unfortunately that time was taken just before your payment came through. Can we agree a new time?`;
+  return (
+    <div className="bg-red-500/10 border border-red-500/40 rounded-2xl p-4">
+      <div className="flex items-start gap-2 mb-2">
+        <AlertCircle size={16} className="text-red-400 flex-shrink-0 mt-0.5" />
+        <div>
+          <p className="text-sm font-bold text-red-300">Needs your attention — paid, but the time clashed</p>
+          <p className="text-xs text-sabi-muted mt-1 leading-relaxed">
+            {client_name} paid ₦{(Number(amount_paid) || 0).toLocaleString()} for {service_name} on {when}, but that time had already been taken
+            when the payment arrived. The money is in your account. Contact them to reschedule or sort it out directly.
+          </p>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap mt-3">
+        {waNumber && (
+          <a href={`https://wa.me/${waNumber}?text=${encodeURIComponent(message)}`} target="_blank" rel="noopener noreferrer"
+            className="flex items-center gap-1 bg-[#25D366]/10 text-[#25D366] text-xs font-bold px-3 py-1.5 rounded-lg border border-[#25D366]/20 no-underline">
+            <MessageCircle size={11} /> Message {client_name}
+          </a>
+        )}
+        <button className="flex items-center gap-1 bg-sabi-border/20 text-sabi-muted text-xs font-bold px-3 py-1.5 rounded-lg border border-sabi-border cursor-pointer hover:text-white transition-colors" onClick={() => onResolve(id)}>
+          <Check size={11} /> Mark as sorted
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const STATUS_STYLES = {
   confirmed: 'bg-sabi-green/10 text-sabi-green border-sabi-green/20',
   pending:   'bg-sabi-gold/10 text-sabi-gold border-sabi-gold/20',
@@ -1024,6 +1105,7 @@ const STATUS_STYLES = {
 
 function BookingCard({ booking, onStatus, onDelete, onRemind, fmtDate, bizSlug, businessName }) {
   const { id, client_name, client_phone, service_name, price, date, time, ampm, status, notes, reminder_sent_at } = booking;
+  const payment = paymentBadge(booking);
   const { copied: ratingCopied, copy: copyRating } = useCopyToClipboard();
 
   const waPhone = normalizeNgPhone(client_phone);
@@ -1079,6 +1161,9 @@ function BookingCard({ booking, onStatus, onDelete, onRemind, fmtDate, bizSlug, 
         {' · '}₦{(price || 0).toLocaleString()}
         {' · '}{fmtDate(date)}{time ? ` · ${time} ${ampm}` : ''}
       </p>
+      <p className={`inline-block text-xs font-semibold rounded-full px-2.5 py-0.5 mt-1 border ${payment.paid ? 'bg-sabi-green/10 text-sabi-green border-sabi-green/20' : 'bg-sabi-border/20 text-sabi-muted border-sabi-border/30'}`}>
+        {payment.label}
+      </p>
       {notes && <p className="text-xs text-sabi-muted bg-sabi-dark rounded px-3 py-2 mt-2 mb-2">{notes}</p>}
       <div className="flex items-center gap-2 mt-3 flex-wrap">
         {status === 'pending' && (
@@ -1092,7 +1177,7 @@ function BookingCard({ booking, onStatus, onDelete, onRemind, fmtDate, bizSlug, 
           </button>
         )}
         {status === 'cancelled' && (
-          <button className="text-sabi-muted text-xs font-semibold px-3 py-1.5 rounded-lg border border-sabi-border bg-transparent cursor-pointer hover:text-white transition-colors" onClick={() => onStatus(id, 'pending')}>
+          <button className="text-sabi-muted text-xs font-semibold px-3 py-1.5 rounded-lg border border-sabi-border bg-transparent cursor-pointer hover:text-white transition-colors" onClick={() => onStatus(id, booking.payment_status === 'paid' ? 'confirmed' : 'pending')}>
             Restore
           </button>
         )}
